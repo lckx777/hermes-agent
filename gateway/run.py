@@ -2005,9 +2005,9 @@ class GatewayRunner:
     def _load_service_tier() -> str | None:
         """Load Priority Processing setting from config.yaml.
 
-        Reads agent.service_tier from config.yaml. Accepted values mirror the CLI:
-        "fast"/"priority"/"on" => "priority", while "normal"/"off" disables it.
-        Returns None when unset or unsupported.
+        Reads agent.service_tier from config.yaml and delegates parsing to
+        ``hermes_constants.parse_service_tier`` — the same canonical parser
+        used by ``cli.py`` so both surfaces speak identical vocabulary.
         """
         raw = ""
         try:
@@ -2020,13 +2020,11 @@ class GatewayRunner:
         except Exception:
             pass
 
-        value = raw.lower()
-        if not value or value in {"normal", "default", "standard", "off", "none"}:
-            return None
-        if value in {"fast", "priority", "on"}:
-            return "priority"
-        logger.warning("Unknown service_tier '%s', ignoring", raw)
-        return None
+        from hermes_constants import parse_service_tier
+        value, recognized = parse_service_tier(raw)
+        if not recognized:
+            logger.warning("Unknown service_tier '%s', ignoring", raw)
+        return value
 
     @staticmethod
     def _load_show_reasoning() -> bool:

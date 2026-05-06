@@ -235,14 +235,18 @@ def _parse_reasoning_config(effort: str) -> dict | None:
 
 
 def _parse_service_tier_config(raw: str) -> str | None:
-    """Parse a persisted service-tier preference into a Responses API value."""
-    value = str(raw or "").strip().lower()
-    if not value or value in {"normal", "default", "standard", "off", "none"}:
-        return None
-    if value in {"fast", "priority", "on"}:
-        return "priority"
-    logger.warning("Unknown service_tier '%s', ignoring", raw)
-    return None
+    """Parse a persisted service-tier preference into a Responses API value.
+
+    Thin wrapper over ``hermes_constants.parse_service_tier`` — the canonical
+    parser is shared with ``gateway/run.py`` so both surfaces accept the same
+    vocabulary (normal/default/standard/off/none/auto → provider default,
+    fast/priority/on/max/maximum/ultra → priority).
+    """
+    from hermes_constants import parse_service_tier
+    value, recognized = parse_service_tier(raw)
+    if not recognized:
+        logger.warning("Unknown service_tier '%s', ignoring", raw)
+    return value
 
 def load_cli_config() -> Dict[str, Any]:
     """

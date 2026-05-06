@@ -111,3 +111,92 @@ class TestIsContainer:
         # Even if we make os.path.exists return False, cached value wins
         monkeypatch.setattr(os.path, "exists", lambda p: False)
         assert is_container() is True
+
+
+# ──────────────────────────────────────────────────────────────────
+# parse_reasoning_effort — alias resilience
+# ──────────────────────────────────────────────────────────────────
+import pytest
+from hermes_constants import parse_reasoning_effort, REASONING_EFFORT_ALIASES
+
+
+class TestParseReasoningEffort:
+    """Lock the contract: user-friendly aliases normalize to canonical levels."""
+
+    @pytest.mark.parametrize("alias,canonical", [
+        ("max", "xhigh"),
+        ("MAX", "xhigh"),
+        (" Max ", "xhigh"),
+        ("maximum", "xhigh"),
+        ("ultra", "xhigh"),
+        ("extreme", "xhigh"),
+        ("min", "minimal"),
+    ])
+    def test_aliases_map_to_canonical(self, alias, canonical):
+        assert parse_reasoning_effort(alias) == {"enabled": True, "effort": canonical}
+
+    @pytest.mark.parametrize("level", ["minimal", "low", "medium", "high", "xhigh"])
+    def test_canonical_levels_pass_through(self, level):
+        assert parse_reasoning_effort(level) == {"enabled": True, "effort": level}
+
+    @pytest.mark.parametrize("disabling", ["none", "off", "disabled"])
+    def test_disabling_aliases(self, disabling):
+        assert parse_reasoning_effort(disabling) == {"enabled": False}
+
+    @pytest.mark.parametrize("empty", ["", "   ", None])
+    def test_empty_returns_none(self, empty):
+        assert parse_reasoning_effort(empty) is None
+
+    @pytest.mark.parametrize("bogus", ["garbage", "supreme", "999"])
+    def test_unknown_returns_none(self, bogus):
+        assert parse_reasoning_effort(bogus) is None
+
+    def test_alias_table_is_consistent(self):
+        """Every alias must resolve to a known canonical level or 'none'."""
+        from hermes_constants import VALID_REASONING_EFFORTS
+        for alias, target in REASONING_EFFORT_ALIASES.items():
+            assert target in VALID_REASONING_EFFORTS or target == "none", (
+                f"Alias {alias!r} → {target!r} is neither a canonical level nor 'none'"
+            )
+
+
+# ──────────────────────────────────────────────────────────────────
+# parse_service_tier — canonical shared parser (cli + gateway)
+# ──────────────────────────────────────────────────────────────────
+from hermes_constants import (
+    parse_service_tier,
+    SERVICE_TIER_OFF_VALUES,
+    SERVICE_TIER_PRIORITY_VALUES,
+)
+
+
+class TestParseServiceTier:
+    """Lock the contract for the shared parser. Both cli.py and
+    gateway/run.py delegate to this — drift between them caused warnings
+    to keep firing after one surface was patched."""
+
+    @pytest.mark.parametrize("raw", [
+        "normal", "default", "standard", "off", "none", "auto",
+        "AUTO", " auto ", "Off",
+    ])
+    def test_off_values_return_none_recognized(self, raw):
+        assert parse_service_tier(raw) == (None, True)
+
+    @pytest.mark.parametrize("raw", [
+        "fast", "priority", "on", "max", "maximum", "ultra",
+        "FAST", " Priority ", "MAX",
+    ])
+    def test_priority_values(self, raw):
+        assert parse_service_tier(raw) == ("priority", True)
+
+    @pytest.mark.parametrize("raw", ["", "   ", None])
+    def test_empty_returns_none_recognized(self, raw):
+        assert parse_service_tier(raw) == (None, True)
+
+    @pytest.mark.parametrize("raw", ["garbage", "supreme", "999", "fasten"])
+    def test_unknown_returns_unrecognized(self, raw):
+        assert parse_service_tier(raw) == (None, False)
+
+    def test_off_and_priority_sets_disjoint(self):
+        """A value cannot be both 'off' and 'priority' simultaneously."""
+        assert SERVICE_TIER_OFF_VALUES.isdisjoint(SERVICE_TIER_PRIORITY_VALUES)

@@ -190,11 +190,26 @@ def get_subprocess_home() -> str | None:
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
+# Aliases mapped to canonical effort levels. Keeps user-facing vocabulary
+# resilient (e.g. "max" is the intuitive label for the highest tier even
+# though the canonical enum is "xhigh"). Extend here, never branch in callers.
+REASONING_EFFORT_ALIASES = {
+    "max": "xhigh",
+    "maximum": "xhigh",
+    "ultra": "xhigh",
+    "extreme": "xhigh",
+    "min": "minimal",
+    "off": "none",
+    "disabled": "none",
+}
+
 
 def parse_reasoning_effort(effort: str) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
     Valid levels: "none", "minimal", "low", "medium", "high", "xhigh".
+    Aliases (max/maximum/ultra/extreme → xhigh, min → minimal,
+    off/disabled → none) are normalized transparently.
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none".
     Returns {"enabled": True, "effort": <level>} for valid effort levels.
@@ -202,11 +217,46 @@ def parse_reasoning_effort(effort: str) -> dict | None:
     if not effort or not effort.strip():
         return None
     effort = effort.strip().lower()
+    effort = REASONING_EFFORT_ALIASES.get(effort, effort)
     if effort == "none":
         return {"enabled": False}
     if effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
     return None
+
+
+# ---------------------------------------------------------------------------
+# service_tier (Responses API "Priority Processing")
+# ---------------------------------------------------------------------------
+# Single source of truth shared by cli.py and gateway/run.py — both used to
+# carry their own duplicated copy of the parsing rules and drifted apart.
+# Now any caller imports parse_service_tier() and gets identical behaviour.
+SERVICE_TIER_OFF_VALUES = frozenset(
+    {"normal", "default", "standard", "off", "none", "auto"}
+)
+SERVICE_TIER_PRIORITY_VALUES = frozenset(
+    {"fast", "priority", "on", "max", "maximum", "ultra"}
+)
+
+
+def parse_service_tier(raw: str) -> tuple[str | None, bool]:
+    """Parse a persisted service-tier preference into a Responses API value.
+
+    Vocabulary:
+      - normal/default/standard/off/none/auto    → (None, True)   provider default
+      - fast/priority/on/max/maximum/ultra       → ("priority", True)
+      - empty / whitespace                       → (None, True)
+      - anything else                            → (None, False)  unknown
+
+    Returns ``(value, recognized)``. ``recognized=False`` means the caller
+    should warn the user — the input was non-empty but not in the vocabulary.
+    """
+    value = str(raw or "").strip().lower()
+    if not value or value in SERVICE_TIER_OFF_VALUES:
+        return None, True
+    if value in SERVICE_TIER_PRIORITY_VALUES:
+        return "priority", True
+    return None, False
 
 
 def is_termux() -> bool:

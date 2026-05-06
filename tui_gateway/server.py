@@ -866,16 +866,20 @@ def _load_reasoning_config() -> dict | None:
 
 
 def _load_service_tier() -> str | None:
-    raw = (
-        str((_load_cfg().get("agent") or {}).get("service_tier", "") or "")
-        .strip()
-        .lower()
-    )
-    if not raw or raw in {"normal", "default", "standard", "off", "none"}:
-        return None
-    if raw in {"fast", "priority", "on"}:
-        return "priority"
-    return None
+    """Load Priority Processing setting from config.yaml.
+
+    Delegates parsing to ``hermes_constants.parse_service_tier`` — the same
+    canonical parser used by ``cli.py`` and ``gateway/run.py`` so all three
+    surfaces accept identical vocabulary (auto/normal/off → provider default,
+    fast/priority/on/max → priority).
+    """
+    from hermes_constants import parse_service_tier
+
+    raw = str((_load_cfg().get("agent") or {}).get("service_tier", "") or "")
+    value, recognized = parse_service_tier(raw)
+    if not recognized:
+        logger.warning("Unknown service_tier '%s', ignoring", raw)
+    return value
 
 
 def _load_show_reasoning() -> bool:
