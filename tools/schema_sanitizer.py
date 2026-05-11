@@ -57,6 +57,59 @@ def sanitize_tool_schemas(tools: list[dict]) -> list[dict]:
     return sanitized
 
 
+def sanitize_tool_parameters(params: Any, *, name: str = "<tool>") -> dict:
+    """Sanitize a raw JSON Schema parameter block (the value of ``parameters``).
+
+    This is the LOW-LEVEL primitive shared by:
+      - ``_sanitize_single_tool`` (for full wrapped/flat tool entries)
+      - ``tools/mcp_tool.py::_register_server_tools`` (for MCP raw schemas
+        of shape ``{name, description, parameters}`` — not a tool wrapper,
+        just the parameters dict pre-registration)
+
+    Both call sites need the SAME sanitization rules; this primitive is the
+    canonical source. Architectural rationale:
+
+      Before this refactor, the wrapped/flat sanitizer extracted parameters,
+      ran the rules, and re-attached. MCP registration could not reuse those
+      rules without faking a tool envelope, so registration ran a LINT-ONLY
+      Tier 2 that quarantined fixable tools (e.g. ClickUp's
+      ``task_type.type=['string','null']`` collapses cleanly to
+      ``type:'string'`` but was being dropped because lint ran without
+      sanitize). Hoisting the rules to a public primitive lets Tier 2 do
+      "sanitize → lint → register" so only IRRECOVERABLE schemas drop.
+
+    Args:
+        params: Raw JSON Schema parameters dict (or any value — handled
+            defensively). Not deep-copied; if you need to preserve the
+            input, copy before calling.
+        name: Path label for nested-error logging.
+
+    Returns:
+        A sanitized parameters dict. Always shape-correct
+        ``{"type": "object", "properties": {...}, ...}``.
+    """
+    # Missing / non-dict parameters → substitute the minimal valid shape.
+    if not isinstance(params, dict):
+        return {"type": "object", "properties": {}}
+
+    sanitized = _sanitize_node(params, path=name)
+
+    # After recursion, guarantee the top-level is an object with properties.
+    if not isinstance(sanitized, dict):
+        return {"type": "object", "properties": {}}
+    if sanitized.get("type") != "object":
+        sanitized["type"] = "object"
+    if "properties" not in sanitized or not isinstance(sanitized.get("properties"), dict):
+        sanitized["properties"] = {}
+
+    # Final pass: collapse nullable anyOf/oneOf unions that the recursive
+    # sanitizer above leaves intact (it only handles the array-form
+    # ``type: [X, "null"]``). Keep the ``nullable: true`` hint so runtime
+    # argument coercion (``model_tools._schema_allows_null``) can still
+    # map a model-emitted ``"null"`` string to Python ``None``.
+    return strip_nullable_unions(sanitized, keep_nullable_hint=True)
+
+
 def _sanitize_single_tool(tool: dict) -> dict:
     """Deep-copy and sanitize a single OpenAI-format tool entry.
 
@@ -68,6 +121,9 @@ def _sanitize_single_tool(tool: dict) -> dict:
     leaving Responses-bound tools un-sanitized and causing 400s like the
     ``mcp_docker_create_container.ports`` failure on
     ``chatgpt.com/backend-api/codex/responses``.
+
+    Delegates rule application to ``sanitize_tool_parameters`` so MCP
+    registration (Tier 2) and provider-call sanitize (Tier 1) share rules.
     """
     out = copy.deepcopy(tool)
     if not isinstance(out, dict):
@@ -93,28 +149,9 @@ def _sanitize_single_tool(tool: dict) -> dict:
         # Unknown shape — pass through (do not mangle non-tool entries)
         return out
 
-    params = container.get("parameters")
-    # Missing / non-dict parameters → substitute the minimal valid shape.
-    if not isinstance(params, dict):
-        container["parameters"] = {"type": "object", "properties": {}}
-        return out
-
-    container["parameters"] = _sanitize_node(params, path=name)
-    # After recursion, guarantee the top-level is an object with properties.
-    top = container["parameters"]
-    if not isinstance(top, dict):
-        container["parameters"] = {"type": "object", "properties": {}}
-    else:
-        if top.get("type") != "object":
-            top["type"] = "object"
-        if "properties" not in top or not isinstance(top.get("properties"), dict):
-            top["properties"] = {}
-    # Final pass: collapse nullable anyOf/oneOf unions that the recursive
-    # sanitizer above leaves intact (it only handles the array-form
-    # ``type: [X, "null"]``). Keep the ``nullable: true`` hint so runtime
-    # argument coercion (``model_tools._schema_allows_null``) can still
-    # map a model-emitted ``"null"`` string to Python ``None``.
-    container["parameters"] = strip_nullable_unions(container["parameters"], keep_nullable_hint=True)
+    container["parameters"] = sanitize_tool_parameters(
+        container.get("parameters"), name=name
+    )
     return out
 
 

@@ -2740,13 +2740,13 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
-        # Tier 2 defence (HX-MCP-S2, 2026-05-11): strict-schema lint at
-        # REGISTRATION time. A malformed MCP tool schema (e.g.
+        # Tier 2 defence (HX-MCP-S2, 2026-05-11): SANITIZE → LINT → register
+        # at registration time. A malformed MCP tool schema (e.g.
         # mcp_docker_create_container.ports.additionalProperties.anyOf[i] =
-        # {type:array} with prefixItems but no items) used to poison the
-        # whole tools[] payload at provider call time, causing HTTP 400
-        # that collapsed every delegate_task and required a full Hermes
-        # restart to recover.
+        # {type:array} with prefixItems but no items, or ClickUp's
+        # task_type.type=['string','null']) used to poison the whole tools[]
+        # payload at provider call time, causing HTTP 400 that collapsed
+        # every delegate_task and required a full Hermes restart.
         #
         # Tier 1 (sanitize_tool_schemas in model_tools.py) is curative,
         # applied to every provider call. Tier 3 (validate_tools_payload
@@ -2755,13 +2755,36 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         # so internal dispatch paths (handle_function_call, kanban worker,
         # anti-pattern policies) never see it either.
         #
+        # Two-stage architecture (HX-MCP-S4, 2026-05-11): the original
+        # Tier 2 ran LINT-ONLY and was dropping FIXABLE tools (observed
+        # 2026-05-11 02:02:09 in production: ClickUp clickup_update_task
+        # quarantined because task_type.type=['string','null'] — a shape
+        # the sanitizer collapses to type:'string' trivially). The correct
+        # architecture is SANITIZE-then-LINT: only IRRECOVERABLE schemas
+        # (e.g. array node without items AND without prefixItems) are
+        # dropped. Recoverable ones (nullable type lists, prefixItems
+        # without items, object without properties, etc.) are fixed in
+        # place and registered.
+        #
         # Toggle: MCP_STRICT_SCHEMA_AUTO_QUARANTINE=0 keeps the tool in the
-        # registry but still emits the WARNING so the operator can decide.
+        # registry even if lint fails after sanitize, but still emits the
+        # WARNING so the operator can decide.
         try:
+            from tools.schema_sanitizer import sanitize_tool_parameters
             from tools.strict_schema_lint import lint_openai_strict_schema
             import os
-            schema_errors = lint_openai_strict_schema(
+
+            # Stage 1: sanitize — fix everything that's mechanically fixable.
+            # Mutates `schema` in place so the registered tool carries the
+            # corrected parameters (single source of truth in the registry).
+            schema["parameters"] = sanitize_tool_parameters(
                 schema.get("parameters", {}),
+                name=tool_name_prefixed,
+            )
+
+            # Stage 2: lint — flag IRRECOVERABLE strict-mode violations.
+            schema_errors = lint_openai_strict_schema(
+                schema["parameters"],
                 path=tool_name_prefixed,
             )
             if schema_errors:
@@ -2771,21 +2794,21 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 if quarantine:
                     logger.warning(
                         "MCP server '%s': tool '%s' (→ '%s') QUARANTINED at "
-                        "registration — strict-schema lint errors: %s. "
-                        "Set MCP_STRICT_SCHEMA_AUTO_QUARANTINE=0 to keep it.",
+                        "registration — IRRECOVERABLE strict-schema lint errors "
+                        "after sanitize: %s. Set MCP_STRICT_SCHEMA_AUTO_QUARANTINE=0 to keep it.",
                         name, mcp_tool.name, tool_name_prefixed, schema_errors,
                     )
                     continue
                 else:
                     logger.warning(
                         "MCP server '%s': tool '%s' (→ '%s') has strict-schema "
-                        "errors but quarantine disabled — registering anyway. "
-                        "Errors: %s",
+                        "errors after sanitize but quarantine disabled — "
+                        "registering anyway. Errors: %s",
                         name, mcp_tool.name, tool_name_prefixed, schema_errors,
                     )
         except Exception as e:  # pragma: no cover — defensive
             logger.warning(
-                "MCP server '%s': tool '%s' — Tier 2 lint skipped: %s",
+                "MCP server '%s': tool '%s' — Tier 2 sanitize+lint skipped: %s",
                 name, mcp_tool.name, e,
             )
 

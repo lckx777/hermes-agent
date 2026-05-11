@@ -3625,71 +3625,24 @@ class TestRegisterMcpServers:
 
 
 class TestTier2RegistrationLint:
-    """When MCP_STRICT_SCHEMA_AUTO_QUARANTINE=1 (default), tools with strict-mode
-    violations must be DROPPED at registration time, so the registry never
-    holds a poison tool that could break the provider call payload.
+    """Tier 2 architecture (HX-MCP-S4, 2026-05-11): SANITIZE → LINT → register.
+
+    Recoverable schemas (nullable type lists, prefixItems missing items,
+    object missing properties) are FIXED in-place by the sanitizer and
+    registered with the corrected parameters. Only IRRECOVERABLE schemas
+    that survive sanitize and still fail lint are quarantined.
     """
 
-    def _setup_server_with_broken_tool(self):
-        """Build a fake MCPServerTask whose _tools contains one valid + one broken."""
-        valid = _make_mcp_tool(
-            name="hello",
-            input_schema={"type": "object", "properties": {"who": {"type": "string"}}},
-        )
-        broken = _make_mcp_tool(
-            name="bad_array",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    # Explicit broken: array without items AND without prefixItems
-                    "things": {"type": "array"},
-                },
-            },
-        )
-        server = SimpleNamespace()
-        server._tools = [valid, broken]
-        server.tool_timeout = 30
-        return server
-
-    def test_broken_tool_is_quarantined_by_default(self, monkeypatch):
+    def _run_register(self, monkeypatch, server, env_value=None):
+        """Helper: run _register_server_tools with stubbed side effects, return
+        list of registered tool names and the final schemas seen by registry."""
         from tools import mcp_tool as mt
         from tools.registry import registry
 
-        # Default env (no MCP_STRICT_SCHEMA_AUTO_QUARANTINE set) → quarantine enabled
-        monkeypatch.delenv("MCP_STRICT_SCHEMA_AUTO_QUARANTINE", raising=False)
-
-        # Stub out the side-effecting bits
-        monkeypatch.setattr(mt, "_scan_mcp_description", lambda *a, **k: None)
-        monkeypatch.setattr(mt, "_make_tool_handler", lambda *a, **k: (lambda **kw: None))
-        monkeypatch.setattr(mt, "_make_check_fn", lambda name: (lambda: True))
-        monkeypatch.setattr(mt, "_select_utility_schemas", lambda *a, **k: [])
-
-        # Spy on registry.register
-        registered = []
-        original_register = registry.register
-        try:
-            registry.register = lambda **kw: registered.append(kw["name"])
-            registry.get_toolset_for_tool = lambda name: None  # no collisions
-            registry.deregister = lambda name: None
-
-            server = self._setup_server_with_broken_tool()
-            mt._register_server_tools("test-srv", server, {})
-        finally:
-            registry.register = original_register
-
-        # Only valid tool registered; broken one dropped
-        assert "mcp_test_srv_hello" in registered, f"valid tool missing: {registered}"
-        assert not any("bad_array" in n for n in registered), (
-            f"broken tool leaked into registry: {registered}"
-        )
-
-    def test_broken_tool_passes_when_quarantine_disabled(self, monkeypatch):
-        """MCP_STRICT_SCHEMA_AUTO_QUARANTINE=0 still emits the WARNING but
-        keeps the tool — operator may want this for debugging an MCP."""
-        from tools import mcp_tool as mt
-        from tools.registry import registry
-
-        monkeypatch.setenv("MCP_STRICT_SCHEMA_AUTO_QUARANTINE", "0")
+        if env_value is None:
+            monkeypatch.delenv("MCP_STRICT_SCHEMA_AUTO_QUARANTINE", raising=False)
+        else:
+            monkeypatch.setenv("MCP_STRICT_SCHEMA_AUTO_QUARANTINE", env_value)
 
         monkeypatch.setattr(mt, "_scan_mcp_description", lambda *a, **k: None)
         monkeypatch.setattr(mt, "_make_tool_handler", lambda *a, **k: (lambda **kw: None))
@@ -3697,19 +3650,126 @@ class TestTier2RegistrationLint:
         monkeypatch.setattr(mt, "_select_utility_schemas", lambda *a, **k: [])
 
         registered = []
+        schemas_seen = {}
         original_register = registry.register
         try:
-            registry.register = lambda **kw: registered.append(kw["name"])
+            def fake_register(**kw):
+                registered.append(kw["name"])
+                schemas_seen[kw["name"]] = kw.get("schema")
+            registry.register = fake_register
             registry.get_toolset_for_tool = lambda name: None
             registry.deregister = lambda name: None
 
-            server = self._setup_server_with_broken_tool()
             mt._register_server_tools("test-srv", server, {})
         finally:
             registry.register = original_register
 
-        # Both tools registered — quarantine disabled
-        assert "mcp_test_srv_hello" in registered
-        assert any("bad_array" in n for n in registered), (
-            f"with quarantine disabled, broken tool should still register: {registered}"
+        return registered, schemas_seen
+
+    def test_fixable_clickup_nullable_type_is_recovered_not_quarantined(self, monkeypatch):
+        """Regression for 2026-05-11 02:02:09 production log: ClickUp
+        clickup_update_task had ``task_type.type=['string','null']`` and
+        the lint-only Tier 2 quarantined it. After SANITIZE-then-LINT,
+        the sanitizer collapses the nullable union and the tool is REGISTERED
+        with corrected parameters.
+        """
+        clickup_like = _make_mcp_tool(
+            name="update_task",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string"},
+                    # Exact shape from production log
+                    "task_type": {"type": ["string", "null"], "default": None},
+                },
+                "required": ["task_id"],
+            },
+        )
+        server = SimpleNamespace()
+        server._tools = [clickup_like]
+        server.tool_timeout = 30
+
+        registered, schemas_seen = self._run_register(monkeypatch, server)
+
+        assert "mcp_test_srv_update_task" in registered, (
+            f"FIXABLE tool was dropped — sanitize+lint architecture not effective: {registered}"
+        )
+        # Verify the registered schema has the corrected type
+        recovered = schemas_seen["mcp_test_srv_update_task"]
+        task_type = recovered["parameters"]["properties"]["task_type"]
+        assert task_type.get("type") == "string", (
+            f"sanitizer should have collapsed type to 'string', got {task_type!r}"
+        )
+        assert task_type.get("nullable") is True, (
+            f"sanitizer should preserve nullable hint, got {task_type!r}"
+        )
+
+    def test_fixable_array_without_items_is_recovered(self, monkeypatch):
+        """An ``{type:array}`` without items is FIXABLE — sanitizer injects
+        ``items: {}``. Tool should register, not quarantine."""
+        fixable = _make_mcp_tool(
+            name="list_things",
+            input_schema={
+                "type": "object",
+                "properties": {"things": {"type": "array"}},
+            },
+        )
+        server = SimpleNamespace()
+        server._tools = [fixable]
+        server.tool_timeout = 30
+
+        registered, schemas_seen = self._run_register(monkeypatch, server)
+
+        assert "mcp_test_srv_list_things" in registered, (
+            f"sanitizer should inject items:{{}}; tool dropped: {registered}"
+        )
+        things = schemas_seen["mcp_test_srv_list_things"]["parameters"]["properties"]["things"]
+        assert "items" in things, f"sanitizer must inject items, got {things!r}"
+
+    def test_quarantine_disabled_via_env(self, monkeypatch):
+        """MCP_STRICT_SCHEMA_AUTO_QUARANTINE=0 keeps tools registered even
+        when lint fails after sanitize. (No tools fail anymore with the
+        current sanitizer rule set, but the toggle is preserved for future
+        edge cases / debugging an MCP server.)
+        """
+        # Construct a synthetic scenario: monkeypatch the lint function
+        # to always return an error, so we can verify the env-var path.
+        from tools import strict_schema_lint as ssl
+        original_lint = ssl.lint_openai_strict_schema
+        monkeypatch.setattr(
+            ssl, "lint_openai_strict_schema",
+            lambda *a, **k: [{"path": "$.synthetic", "reason": "forced failure"}]
+        )
+
+        tool = _make_mcp_tool(name="any_tool")
+        server = SimpleNamespace()
+        server._tools = [tool]
+        server.tool_timeout = 30
+
+        # With quarantine disabled → tool registers despite forced lint failure
+        registered, _ = self._run_register(monkeypatch, server, env_value="0")
+        assert any("any_tool" in n for n in registered), (
+            f"quarantine disabled should keep tool: {registered}"
+        )
+
+    def test_quarantine_enabled_drops_irrecoverable(self, monkeypatch):
+        """When lint fails after sanitize AND quarantine is enabled,
+        the tool must be dropped (logged but not registered)."""
+        from tools import strict_schema_lint as ssl
+        # Force lint failure (the sanitizer is too aggressive to find a
+        # natural irrecoverable case with current rules)
+        monkeypatch.setattr(
+            ssl, "lint_openai_strict_schema",
+            lambda *a, **k: [{"path": "$.synthetic", "reason": "forced failure"}]
+        )
+
+        tool = _make_mcp_tool(name="poison_tool")
+        server = SimpleNamespace()
+        server._tools = [tool]
+        server.tool_timeout = 30
+
+        # Default env (quarantine enabled) → tool dropped
+        registered, _ = self._run_register(monkeypatch, server)
+        assert not any("poison_tool" in n for n in registered), (
+            f"quarantine enabled must drop tool: {registered}"
         )
