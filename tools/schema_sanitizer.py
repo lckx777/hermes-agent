@@ -58,23 +58,52 @@ def sanitize_tool_schemas(tools: list[dict]) -> list[dict]:
 
 
 def _sanitize_single_tool(tool: dict) -> dict:
-    """Deep-copy and sanitize a single OpenAI-format tool entry."""
+    """Deep-copy and sanitize a single OpenAI-format tool entry.
+
+    Supports BOTH tool shapes:
+      - Chat Completions: ``{"type": "function", "function": {"name", "parameters"}}``
+      - Responses API:    ``{"type": "function", "name": ..., "parameters": ...}``
+    The Codex Responses adapter (``agent/codex_responses_adapter.py``) ships
+    the flat shape; the historical sanitizer only walked the wrapped shape,
+    leaving Responses-bound tools un-sanitized and causing 400s like the
+    ``mcp_docker_create_container.ports`` failure on
+    ``chatgpt.com/backend-api/codex/responses``.
+    """
     out = copy.deepcopy(tool)
-    fn = out.get("function") if isinstance(out, dict) else None
-    if not isinstance(fn, dict):
+    if not isinstance(out, dict):
         return out
 
-    params = fn.get("parameters")
+    # Detect shape — wrapped (Chat Completions) takes precedence.
+    fn = out.get("function") if isinstance(out.get("function"), dict) else None
+    flat_responses_shape = (
+        fn is None
+        and out.get("type") == "function"
+        and isinstance(out.get("parameters"), (dict, type(None)))
+    )
+
+    if fn is not None:
+        # Chat Completions wrapped form
+        container = fn
+        name = fn.get("name", "<tool>")
+    elif flat_responses_shape:
+        # Responses API flat form — sanitize parameters on `out` directly
+        container = out
+        name = out.get("name", "<tool>")
+    else:
+        # Unknown shape — pass through (do not mangle non-tool entries)
+        return out
+
+    params = container.get("parameters")
     # Missing / non-dict parameters → substitute the minimal valid shape.
     if not isinstance(params, dict):
-        fn["parameters"] = {"type": "object", "properties": {}}
+        container["parameters"] = {"type": "object", "properties": {}}
         return out
 
-    fn["parameters"] = _sanitize_node(params, path=fn.get("name", "<tool>"))
+    container["parameters"] = _sanitize_node(params, path=name)
     # After recursion, guarantee the top-level is an object with properties.
-    top = fn["parameters"]
+    top = container["parameters"]
     if not isinstance(top, dict):
-        fn["parameters"] = {"type": "object", "properties": {}}
+        container["parameters"] = {"type": "object", "properties": {}}
     else:
         if top.get("type") != "object":
             top["type"] = "object"
@@ -85,7 +114,7 @@ def _sanitize_single_tool(tool: dict) -> dict:
     # ``type: [X, "null"]``). Keep the ``nullable: true`` hint so runtime
     # argument coercion (``model_tools._schema_allows_null``) can still
     # map a model-emitted ``"null"`` string to Python ``None``.
-    fn["parameters"] = strip_nullable_unions(fn["parameters"], keep_nullable_hint=True)
+    container["parameters"] = strip_nullable_unions(container["parameters"], keep_nullable_hint=True)
     return out
 
 

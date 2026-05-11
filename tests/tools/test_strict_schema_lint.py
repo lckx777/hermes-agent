@@ -167,3 +167,84 @@ def test_env_zero_disables_auto_quarantine(monkeypatch):
     clean, quarantined = validate_tools_payload([bad])
     assert len(clean) == 1
     assert len(quarantined) == 1
+
+
+# ---------------------------------------------------------------------------
+# Responses API flat tool shape — regression for codex_responses_adapter
+# ---------------------------------------------------------------------------
+
+
+def _flat_tool(name: str, params: dict) -> dict:
+    """Build a Responses-API flat-shape tool (no `function` wrapper).
+
+    This is the shape shipped by ``agent/codex_responses_adapter.py`` to
+    ``chatgpt.com/backend-api/codex/responses``.
+    """
+    return {"type": "function", "name": name, "parameters": params}
+
+
+def test_lint_tool_supports_responses_flat_shape():
+    # A clean flat-shape tool with no params returns no errors.
+    assert lint_tool(_flat_tool("noop", None)) == []
+    # A clean flat-shape with a valid object schema returns no errors.
+    assert lint_tool(_flat_tool("ok", {"type": "object", "properties": {}})) == []
+
+
+def test_lint_tool_flags_array_missing_items_in_responses_flat_shape():
+    bad_params = {
+        "type": "object",
+        "properties": {"things": {"type": "array"}},  # missing items
+    }
+    errors = lint_tool(_flat_tool("bad_flat", bad_params))
+    assert any("array node missing items" in e["reason"] for e in errors), errors
+
+
+def test_validate_tools_payload_mcp_docker_create_container_ports_responses_shape():
+    """The exact regression: flat-shape mcp_docker_create_container with
+    prefixItems-only tuple variant inside ports.additionalProperties.anyOf[2].
+
+    Before fix: lint_tool returned [{"path": "$.function", ...}] because it
+    only recognized the wrapped shape, so the broken tool slipped through
+    validate_tools_payload's clean partition and hit the provider's 400.
+
+    After fix: lint_tool walks the flat shape's parameters, the prefixItems
+    tuple variant either passes (if sanitized first → it gets ``items``
+    injected) or is flagged correctly (if a future sanitizer regression
+    drops the items derivation).
+    """
+    # Post-sanitize shape (what should reach validate_tools_payload):
+    sanitized_ports_ap = {
+        "anyOf": [
+            {"type": "integer"},
+            {"items": {"type": "integer"}, "type": "array"},
+            {
+                "maxItems": 2, "minItems": 2,
+                "prefixItems": [
+                    {"type": "string"},
+                    {"type": "integer"},
+                ],
+                "type": "array",
+                "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+            },
+            {"type": "null"},
+        ]
+    }
+    sanitized_tool = _flat_tool(
+        "mcp_docker_create_container",
+        {
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "object",
+                    "additionalProperties": sanitized_ports_ap,
+                    "properties": {},
+                }
+            },
+        },
+    )
+    clean, quarantined = validate_tools_payload([sanitized_tool])
+    assert len(clean) == 1, (
+        f"Sanitized flat-shape tool must pass lint; got {len(quarantined)} quarantined: "
+        f"{quarantined}"
+    )
+    assert quarantined == []

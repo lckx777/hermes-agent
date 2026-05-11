@@ -129,17 +129,29 @@ def _walk(node: Any, path: str, errors: list[dict]) -> None:
 def lint_tool(tool: dict) -> list[dict]:
     """Lint a single OpenAI-format tool entry.
 
-    Returns errors found in ``tool["function"]["parameters"]``.
+    Supports BOTH shapes:
+      - Chat Completions wrapped: ``{"type": "function", "function": {"name", "parameters"}}``
+      - Responses API flat:       ``{"type": "function", "name": ..., "parameters": ...}``
+
+    Returns errors found in the tool's ``parameters`` schema.
     """
     if not isinstance(tool, dict):
         return [{"path": "$", "reason": f"tool must be dict, got {type(tool).__name__}"}]
-    fn = tool.get("function")
-    if not isinstance(fn, dict):
+
+    # Chat Completions wrapped form takes precedence.
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else None
+    if fn is not None:
+        params = fn.get("parameters")
+        name = fn.get("name", "<tool>")
+    elif tool.get("type") == "function" and "name" in tool:
+        # Responses API flat form (codex_responses_adapter)
+        params = tool.get("parameters")
+        name = tool.get("name", "<tool>")
+    else:
         return [{"path": "$.function", "reason": "missing or non-dict function"}]
-    params = fn.get("parameters")
+
     if params is None:
         return []  # tool with no params is valid
-    name = fn.get("name", "<tool>")
     return lint_openai_strict_schema(params, path=name)
 
 

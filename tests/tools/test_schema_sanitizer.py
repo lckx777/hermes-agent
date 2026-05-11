@@ -350,3 +350,68 @@ def test_strip_none_returns_zero():
     tools, stripped = strip_pattern_and_format(None)
     assert tools is None
     assert stripped == 0
+
+
+# ---------------------------------------------------------------------------
+# Responses API flat tool shape — regression for codex_responses_adapter
+# ---------------------------------------------------------------------------
+
+
+def test_sanitize_handles_responses_api_flat_shape():
+    """Codex Responses adapter sends tools without the ``function`` wrapper.
+
+    Regression: before fix, _sanitize_single_tool returned non-wrapped tools
+    untouched, so prefixItems→items collapse never ran for Responses-bound
+    tools. The exact mcp_docker_create_container.ports failure on the
+    chatgpt.com/backend-api/codex/responses endpoint was caused by this gap.
+    """
+    from tools.schema_sanitizer import sanitize_tool_schemas
+
+    broken = {
+        "type": "function",
+        "name": "mcp_docker_create_container",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "ports": {
+                    "type": "object",
+                    "additionalProperties": {
+                        "anyOf": [
+                            {"type": "integer"},
+                            {
+                                "type": "array",
+                                "prefixItems": [
+                                    {"type": "string"},
+                                    {"type": "integer"},
+                                ],
+                                "maxItems": 2, "minItems": 2,
+                            },
+                        ]
+                    },
+                    "properties": {},
+                }
+            },
+        },
+    }
+    sanitized = sanitize_tool_schemas([broken])
+    assert len(sanitized) == 1
+    out = sanitized[0]
+    # The flat shape preserves no wrapper — sanitization mutates parameters in-place
+    assert "function" not in out
+    assert out["name"] == "mcp_docker_create_container"
+    # The tuple variant must have ``items`` injected after sanitization
+    tuple_variant = out["parameters"]["properties"]["ports"]["additionalProperties"]["anyOf"][1]
+    assert tuple_variant["type"] == "array"
+    assert "items" in tuple_variant, (
+        f"prefixItems should have items derived; got {tuple_variant}"
+    )
+
+
+def test_sanitize_preserves_unknown_shape_passthrough():
+    """A dict that's NOT a function tool (no `function` and no `type: function`)
+    must be returned unchanged — don't mangle non-tool entries."""
+    from tools.schema_sanitizer import sanitize_tool_schemas
+
+    weird = {"some_random_key": "value", "type": "literal_not_function"}
+    out = sanitize_tool_schemas([weird])
+    assert out == [weird]

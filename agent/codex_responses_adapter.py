@@ -220,6 +220,27 @@ def _responses_tools(tools: Optional[List[Dict[str, Any]]] = None) -> Optional[L
             "strict": False,
             "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
         })
+
+    # Tier 3 defence-in-depth (HX-MCP-S3, 2026-05-11): final strict-lint pass
+    # before the converted tools[] reaches chatgpt.com/backend-api/codex/responses.
+    # If a tool slipped through the wrapped-shape sanitizer in model_tools and
+    # still has a strict-mode violation (e.g. an array node without items, or
+    # a tuple `prefixItems` without derived `items`), drop it with a structured
+    # WARNING instead of letting the API return a 400 that crashes the whole
+    # turn. Env var MCP_STRICT_SCHEMA_AUTO_QUARANTINE=0 disables the drop.
+    try:
+        from tools.strict_schema_lint import validate_tools_payload
+        clean, quarantined = validate_tools_payload(converted)
+        if quarantined:
+            logger.warning(
+                "codex_responses_adapter: quarantined %d tool(s) at provider call: %s",
+                len(quarantined),
+                [q.get("tool") for q in quarantined],
+            )
+        converted = clean
+    except Exception as e:  # pragma: no cover — defensive
+        logger.warning("codex_responses_adapter: tier-3 strict lint skipped: %s", e)
+
     return converted or None
 
 
