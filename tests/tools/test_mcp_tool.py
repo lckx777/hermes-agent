@@ -3617,3 +3617,99 @@ class TestRegisterMcpServers:
                 )
 
         _servers.pop("srv", None)
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 (HX-MCP-S2) — strict-schema lint at registration time
+# ---------------------------------------------------------------------------
+
+
+class TestTier2RegistrationLint:
+    """When MCP_STRICT_SCHEMA_AUTO_QUARANTINE=1 (default), tools with strict-mode
+    violations must be DROPPED at registration time, so the registry never
+    holds a poison tool that could break the provider call payload.
+    """
+
+    def _setup_server_with_broken_tool(self):
+        """Build a fake MCPServerTask whose _tools contains one valid + one broken."""
+        valid = _make_mcp_tool(
+            name="hello",
+            input_schema={"type": "object", "properties": {"who": {"type": "string"}}},
+        )
+        broken = _make_mcp_tool(
+            name="bad_array",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    # Explicit broken: array without items AND without prefixItems
+                    "things": {"type": "array"},
+                },
+            },
+        )
+        server = SimpleNamespace()
+        server._tools = [valid, broken]
+        server.tool_timeout = 30
+        return server
+
+    def test_broken_tool_is_quarantined_by_default(self, monkeypatch):
+        from tools import mcp_tool as mt
+        from tools.registry import registry
+
+        # Default env (no MCP_STRICT_SCHEMA_AUTO_QUARANTINE set) → quarantine enabled
+        monkeypatch.delenv("MCP_STRICT_SCHEMA_AUTO_QUARANTINE", raising=False)
+
+        # Stub out the side-effecting bits
+        monkeypatch.setattr(mt, "_scan_mcp_description", lambda *a, **k: None)
+        monkeypatch.setattr(mt, "_make_tool_handler", lambda *a, **k: (lambda **kw: None))
+        monkeypatch.setattr(mt, "_make_check_fn", lambda name: (lambda: True))
+        monkeypatch.setattr(mt, "_select_utility_schemas", lambda *a, **k: [])
+
+        # Spy on registry.register
+        registered = []
+        original_register = registry.register
+        try:
+            registry.register = lambda **kw: registered.append(kw["name"])
+            registry.get_toolset_for_tool = lambda name: None  # no collisions
+            registry.deregister = lambda name: None
+
+            server = self._setup_server_with_broken_tool()
+            mt._register_server_tools("test-srv", server, {})
+        finally:
+            registry.register = original_register
+
+        # Only valid tool registered; broken one dropped
+        assert "mcp_test_srv_hello" in registered, f"valid tool missing: {registered}"
+        assert not any("bad_array" in n for n in registered), (
+            f"broken tool leaked into registry: {registered}"
+        )
+
+    def test_broken_tool_passes_when_quarantine_disabled(self, monkeypatch):
+        """MCP_STRICT_SCHEMA_AUTO_QUARANTINE=0 still emits the WARNING but
+        keeps the tool — operator may want this for debugging an MCP."""
+        from tools import mcp_tool as mt
+        from tools.registry import registry
+
+        monkeypatch.setenv("MCP_STRICT_SCHEMA_AUTO_QUARANTINE", "0")
+
+        monkeypatch.setattr(mt, "_scan_mcp_description", lambda *a, **k: None)
+        monkeypatch.setattr(mt, "_make_tool_handler", lambda *a, **k: (lambda **kw: None))
+        monkeypatch.setattr(mt, "_make_check_fn", lambda name: (lambda: True))
+        monkeypatch.setattr(mt, "_select_utility_schemas", lambda *a, **k: [])
+
+        registered = []
+        original_register = registry.register
+        try:
+            registry.register = lambda **kw: registered.append(kw["name"])
+            registry.get_toolset_for_tool = lambda name: None
+            registry.deregister = lambda name: None
+
+            server = self._setup_server_with_broken_tool()
+            mt._register_server_tools("test-srv", server, {})
+        finally:
+            registry.register = original_register
+
+        # Both tools registered — quarantine disabled
+        assert "mcp_test_srv_hello" in registered
+        assert any("bad_array" in n for n in registered), (
+            f"with quarantine disabled, broken tool should still register: {registered}"
+        )

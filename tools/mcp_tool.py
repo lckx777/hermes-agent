@@ -2740,6 +2740,55 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
+        # Tier 2 defence (HX-MCP-S2, 2026-05-11): strict-schema lint at
+        # REGISTRATION time. A malformed MCP tool schema (e.g.
+        # mcp_docker_create_container.ports.additionalProperties.anyOf[i] =
+        # {type:array} with prefixItems but no items) used to poison the
+        # whole tools[] payload at provider call time, causing HTTP 400
+        # that collapsed every delegate_task and required a full Hermes
+        # restart to recover.
+        #
+        # Tier 1 (sanitize_tool_schemas in model_tools.py) is curative,
+        # applied to every provider call. Tier 3 (validate_tools_payload
+        # in codex_responses_adapter) is defensive at the call site.
+        # Tier 2 is IMMUNIZING — the broken tool never enters the registry,
+        # so internal dispatch paths (handle_function_call, kanban worker,
+        # anti-pattern policies) never see it either.
+        #
+        # Toggle: MCP_STRICT_SCHEMA_AUTO_QUARANTINE=0 keeps the tool in the
+        # registry but still emits the WARNING so the operator can decide.
+        try:
+            from tools.strict_schema_lint import lint_openai_strict_schema
+            import os
+            schema_errors = lint_openai_strict_schema(
+                schema.get("parameters", {}),
+                path=tool_name_prefixed,
+            )
+            if schema_errors:
+                quarantine = os.environ.get(
+                    "MCP_STRICT_SCHEMA_AUTO_QUARANTINE", "1"
+                ).strip() not in ("0", "false", "False", "no", "")
+                if quarantine:
+                    logger.warning(
+                        "MCP server '%s': tool '%s' (→ '%s') QUARANTINED at "
+                        "registration — strict-schema lint errors: %s. "
+                        "Set MCP_STRICT_SCHEMA_AUTO_QUARANTINE=0 to keep it.",
+                        name, mcp_tool.name, tool_name_prefixed, schema_errors,
+                    )
+                    continue
+                else:
+                    logger.warning(
+                        "MCP server '%s': tool '%s' (→ '%s') has strict-schema "
+                        "errors but quarantine disabled — registering anyway. "
+                        "Errors: %s",
+                        name, mcp_tool.name, tool_name_prefixed, schema_errors,
+                    )
+        except Exception as e:  # pragma: no cover — defensive
+            logger.warning(
+                "MCP server '%s': tool '%s' — Tier 2 lint skipped: %s",
+                name, mcp_tool.name, e,
+            )
+
         registry.register(
             name=tool_name_prefixed,
             toolset=toolset_name,
